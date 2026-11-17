@@ -49,6 +49,18 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from pathlib import Path
 
+_HERE = Path(__file__).resolve().parent  # anchor out_dir here, not on cwd at launch
+
+
+def _result_figure_dirs(out_dir: str) -> tuple[Path, Path]:
+    """Category folder (out_dir) -> (result/, figure/) subfolders, both created."""
+    base = Path(out_dir)
+    result_dir = base / "result"
+    figure_dir = base / "figure"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    return result_dir, figure_dir
+
 
 @dataclass
 class PhysSimParams:
@@ -72,7 +84,7 @@ class PhysSimParams:
                                    # set high so max_time is the only real cutoff, not this
     max_time:      float = 7200.0
     num_trials:    int   = 50
-    out_dir:       str   = "../output"
+    out_dir:       str   = str(_HERE / ".." / "output" / "abstract_model")
 
 
 def _T(n, p):
@@ -88,7 +100,23 @@ def _t_fusion_approach(p, rng):
     return rng.gamma(p.t_fusion_gamma_shape, p.t_fusion_gamma_scale_frac * p.t_fusion_max)
 
 
-def simulate_one_trial(p: PhysSimParams, rng: np.random.Generator) -> dict:
+def simulate_one_trial(p: PhysSimParams, rng: np.random.Generator,
+                        run_to_horizon: bool = False,
+                        track_agent: int | None = None) -> dict:
+    """`run_to_horizon`: skip the normal done.all() early-stop and instead
+    run every agent for the full p.max_time — needed whenever exact
+    convergence is structurally impossible (num_agents % n_star != 0, so no
+    set of groups can ever all simultaneously equal exactly n_star) and you
+    want a fair fixed-horizon comparison across configurations regardless.
+    In this mode, an agent that reaches n_star does not freeze (freezing
+    would stop it from ever reacting to a later group-size change caused by
+    other agents); it keeps re-checking on the same T_0*2 cadence
+    `reset_timers` already uses for an at-target group.
+    `track_agent`: if given an agent id, also returns 'size_history' — a
+    (t, size) log of that one agent's own group-size trajectory, for
+    building a per-agent time-weighted size distribution (the aggregate
+    'snaps' log records all groups' sizes at each step but not which agent
+    is in which group, so it can't answer this for one individual)."""
     N, tie = p.num_agents, 0
     agent_gid = np.arange(N, dtype=int)
     grp: dict[int, set] = {i: {i} for i in range(N)}
@@ -230,6 +258,14 @@ def simulate_one_trial(p: PhysSimParams, rng: np.random.Generator) -> dict:
                 stay(t + _T(n_new, p), m)
 
     snaps, wall = [], 0.0
+    size_history: list = []
+
+    def _snap(t):
+        snaps.append((t, sorted([len(m) for m in grp.values()], reverse=True)))
+        if track_agent is not None:
+            g = agent_gid[track_agent]
+            size_history.append((t, len(grp.get(g, (track_agent,)))))
+
     for i in range(N):
         decide(0.0, i)
 
@@ -269,12 +305,15 @@ def simulate_one_trial(p: PhysSimParams, rng: np.random.Generator) -> dict:
                 decide(t, a)                    # group dissolved → RANDOM_WALK
                 continue
             dec[a] += 1
-            snaps.append((t, sorted([len(m) for m in grp.values()], reverse=True)))
+            _snap(t)
             if n == p.n_star:
-                done[a] = True
-                if done.all():
-                    wall = t
-                    break
+                if run_to_horizon:
+                    stay(t + p.T_0 * 2, a)      # keep re-checking, don't freeze
+                else:
+                    done[a] = True
+                    if done.all():
+                        wall = t
+                        break
             elif n > p.n_star:
                 # Overfull: probabilistic fission
                 if rng.random() < _ps(n, p):
@@ -297,19 +336,22 @@ def simulate_one_trial(p: PhysSimParams, rng: np.random.Generator) -> dict:
             target_agent = ex                   # target is an individual, always exists
             g = agent_gid[target_agent]
             dec[a] += 1
-            snaps.append((t, sorted([len(m) for m in grp.values()], reverse=True)))
+            _snap(t)
             join(a, g, t)
             schedule_perception(g, t)
 
         elif tag == 'D':                        # RANDOM_WALK: re-evaluate current situation
             n = pn(a)
             dec[a] += 1
-            snaps.append((t, sorted([len(m) for m in grp.values()], reverse=True)))
+            _snap(t)
             if n == p.n_star:
-                done[a] = True
-                if done.all():
-                    wall = t
-                    break
+                if run_to_horizon:
+                    stay(t + p.T_0 * 2, a)      # keep re-checking, don't freeze
+                else:
+                    done[a] = True
+                    if done.all():
+                        wall = t
+                        break
             elif n > p.n_star:
                 stay(t, a)
             elif n > 1:
@@ -345,6 +387,7 @@ def simulate_one_trial(p: PhysSimParams, rng: np.random.Generator) -> dict:
         'overshoot_count':    len(overshoot_durations),
         'overshoot_dur_mean': float(np.mean(overshoot_durations)) if overshoot_durations else 0.0,
         'overshoot_time':     float(sum(overshoot_durations)),
+        'size_history': size_history if track_agent is not None else None,
     }
 
 
@@ -354,14 +397,21 @@ def _run_chunk(args: tuple) -> dict:
     chunks back together per cell however they finish, so idle workers can
     pick up chunks from whichever cell still has work left instead of one
     expensive cell being stuck on a single worker for its whole
-    trials_per_cell. Module-level so it can be pickled to workers."""
-    p2, seed, cell_idx, chunk_trials = args
+    trials_per_cell. Module-level so it can be pickled to workers.
+
+    `cutoff_s`, if given, treats a trial that technically converged but took
+    longer than cutoff_s as not converged for reporting purposes: it's
+    dropped from decs/times (so it can't drag mean_time up) and from n_ok
+    (so conv_rate reflects "converged within cutoff_s" instead of "converged
+    eventually, however long that took")."""
+    p2, seed, cell_idx, chunk_trials, cutoff_s = args
     rng0 = np.random.default_rng(seed)
     decs, times, n_ok = [], [], 0
     os_counts, os_durs, os_totals = [], [], []
     for _ in range(chunk_trials):
         r = simulate_one_trial(p2, np.random.default_rng(int(rng0.integers(0, 2**31))))
-        if r['converged']:
+        converged = r['converged'] and (cutoff_s is None or r['total_time'] <= cutoff_s)
+        if converged:
             n_ok += 1
             decs.append(float(r['decisions'].mean()))
             times.append(r['total_time'])
@@ -390,14 +440,17 @@ def _finalize_cell(acc: dict) -> dict:
 
 
 def _run_sweep_chunked(cell_params: list, labels: list, trials_per_cell: int, seed: int,
-                        processes: int, chunk_size: int = 50) -> list:
+                        processes: int, chunk_size: int = 50, cutoff_s: float | None = None) -> list:
     """Split every cell's trials_per_cell into ~chunk_size-trial chunks,
     pool ALL cells' chunks into one shared job queue, and run with
     imap_unordered so a free worker always grabs the next chunk regardless
     of which cell it belongs to — an expensive cell gets help from every
     worker instead of monopolizing one. Returns finalized per-cell result
     dicts (mean_dec/std_dec/mean_time/std_time/conv_rate/os_*), aligned
-    with cell_params/labels order."""
+    with cell_params/labels order.
+
+    `cutoff_s` (see _run_chunk) is optional and defaults to None (no
+    truncation, existing behavior) — only sweep_t_max currently sets it."""
     n_cells = len(cell_params)
     cell_seeds = np.random.SeedSequence(seed).spawn(n_cells)
     jobs = []
@@ -408,7 +461,7 @@ def _run_sweep_chunked(cell_params: list, labels: list, trials_per_cell: int, se
         for chunk_seed in chunk_seeds:
             ct = min(chunk_size, remaining)
             remaining -= ct
-            jobs.append((p2, chunk_seed, ci, ct))
+            jobs.append((p2, chunk_seed, ci, ct, cutoff_s))
     total_jobs = len(jobs)
 
     accs = [{'decs': [], 'times': [], 'os_counts': [], 'os_durs': [], 'os_totals': [],
@@ -471,8 +524,7 @@ def run_trials(p: PhysSimParams, seed: int = 0) -> dict:
 
 
 def save_and_plot(s: dict, p: PhysSimParams):
-    out = Path(p.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out, fig_out = _result_figure_dirs(p.out_dir)
 
     with open(out / "summary.csv", "w", newline="") as f:
         w = csv.writer(f)
@@ -486,7 +538,7 @@ def save_and_plot(s: dict, p: PhysSimParams):
         for i, (d, t) in enumerate(zip(s['all_dec'], s['all_t'])):
             w.writerow([i + 1, round(d, 2), round(t, 1)])
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4), dpi=120)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4), dpi=300)
     for ax, data, xlabel, color in [
         (ax1, s['all_dec'], "Decisions / agent", 'C0'),
         (ax2, s['all_t'],   "Convergence time (s)", 'C1'),
@@ -504,10 +556,10 @@ def save_and_plot(s: dict, p: PhysSimParams):
     ax2.set_title(f"t_search~Exp({p.t_search_mean}s), t_fusion≤{p.t_fusion_max}s, "
                   f"T_0={p.T_0}s")
     fig.tight_layout()
-    fig.savefig(out / "convergence_stats.png")
+    fig.savefig(fig_out / "convergence_stats.png")
     plt.close()
 
-    print(f"\n→ {out}")
+    print(f"\n→ {out.parent}")
     print(f"  decisions : {s['mean_dec']:.1f} ± {s['std_dec']:.1f}")
     print(f"  time      : {s['mean_t']:.0f} s ± {s['std_t']:.0f} s")
     print(f"  converged : {s['conv_rate']*100:.0f}%")
@@ -553,8 +605,7 @@ def sweep_alpha_beta(base: PhysSimParams, values=None, trials_per_cell: int = 20
         mat_os_total[i, j] = res['os_total']
 
     # ── save CSVs ──────────────────────────────────────────────────────────
-    out = Path(base.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out, fig_out = _result_figure_dirs(base.out_dir)
     for name, mat in [
         ("sweep_decisions",       mat_dec),
         ("sweep_time",            mat_time),
@@ -596,25 +647,25 @@ def sweep_alpha_beta(base: PhysSimParams, values=None, trials_per_cell: int = 20
                                 fontsize=6.5, color="black" if val < vmax * 0.7 else "white")
 
     # figure 1: convergence metrics
-    fig1, axes1 = plt.subplots(1, 2, figsize=(13, 5), dpi=130)
+    fig1, axes1 = plt.subplots(1, 2, figsize=(13, 5), dpi=300)
     _heatmap([
         (axes1[0], mat_dec,  "Mean decisions / agent",    "YlOrRd", "{:.0f}"),
         (axes1[1], mat_time, "Mean convergence time (s)", "YlOrRd", "{:.0f}"),
     ])
     fig1.suptitle(suptitle, fontsize=11)
     fig1.tight_layout()
-    fig1.savefig(out / "sweep_alpha_beta.png")
+    fig1.savefig(fig_out / "sweep_alpha_beta.png")
     plt.close(fig1)
 
     # figure 1b: standalone convergence-time heatmap (paper-ready, vector PDF, no title)
-    fig1b, ax1b = plt.subplots(figsize=(6.5, 5.5), dpi=150)
+    fig1b, ax1b = plt.subplots(figsize=(6.5, 5.5), dpi=300)
     _heatmap([(ax1b, mat_time, "Mean convergence time (s)", "YlOrRd", "{:.0f}")], show_title=False)
     fig1b.tight_layout()
-    fig1b.savefig(out / "convergence_time.pdf")
+    fig1b.savefig(fig_out / "convergence_time.pdf")
     plt.close(fig1b)
 
     # figure 2: overshoot metrics
-    fig2, axes2 = plt.subplots(1, 3, figsize=(18, 5), dpi=130)
+    fig2, axes2 = plt.subplots(1, 3, figsize=(18, 5), dpi=300)
     _heatmap([
         (axes2[0], mat_os_count, "Mean overshoot count / trial",      "Blues",  "{:.1f}"),
         (axes2[1], mat_os_dur,   "Mean overshoot duration (s)",        "Oranges","{:.2f}"),
@@ -622,20 +673,20 @@ def sweep_alpha_beta(base: PhysSimParams, values=None, trials_per_cell: int = 20
     ])
     fig2.suptitle(suptitle, fontsize=11)
     fig2.tight_layout()
-    fig2.savefig(out / "sweep_overshoot.png")
+    fig2.savefig(fig_out / "sweep_overshoot.png")
     plt.close(fig2)
 
     # figure 2b: standalone overshoot-time heatmap (paper-ready, vector PDF, no title)
-    fig2b, ax2b = plt.subplots(figsize=(6.5, 5.5), dpi=150)
+    fig2b, ax2b = plt.subplots(figsize=(6.5, 5.5), dpi=300)
     _heatmap([(ax2b, mat_os_total, "Mean total overshoot time / trial (s)", "Reds", "{:.1f}")], show_title=False)
     fig2b.tight_layout()
-    fig2b.savefig(out / "overshoot_time.pdf")
+    fig2b.savefig(fig_out / "overshoot_time.pdf")
     plt.close(fig2b)
 
-    print(f"\n[Sweep] → {out / 'sweep_alpha_beta.png'}")
-    print(f"[Sweep] → {out / 'convergence_time.pdf'}")
-    print(f"[Sweep] → {out / 'sweep_overshoot.png'}")
-    print(f"[Sweep] → {out / 'overshoot_time.pdf'}")
+    print(f"\n[Sweep] → {fig_out / 'sweep_alpha_beta.png'}")
+    print(f"[Sweep] → {fig_out / 'convergence_time.pdf'}")
+    print(f"[Sweep] → {fig_out / 'sweep_overshoot.png'}")
+    print(f"[Sweep] → {fig_out / 'overshoot_time.pdf'}")
 
 
 def sweep_fusion_fission_time(base: PhysSimParams, fusion_values=None, fiss_values=None,
@@ -683,8 +734,7 @@ def sweep_fusion_fission_time(base: PhysSimParams, fusion_values=None, fiss_valu
         mat_dec[i, j]  = res['mean_dec']
         mat_conv[i, j] = res['conv_rate']
 
-    out = Path(base.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out, fig_out = _result_figure_dirs(base.out_dir)
     for name, mat in [
         ("sweep_fusion_fission_time", mat_time),
         ("sweep_fusion_fission_dec",  mat_dec),
@@ -707,7 +757,7 @@ def sweep_fusion_fission_time(base: PhysSimParams, fusion_values=None, fiss_valu
     from matplotlib.colors import LogNorm
     norm = LogNorm(vmin=np.nanmin(mat_time), vmax=np.nanmax(mat_time))
 
-    fig, ax = plt.subplots(figsize=(7.0, 5.5), dpi=150)
+    fig, ax = plt.subplots(figsize=(7.0, 5.5), dpi=300)
     im = ax.imshow(mat_time, origin="lower", cmap="YlOrRd", aspect="auto", norm=norm)
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     # Bare powers of ten (10^3, 10^4) that fall within the data's actual
@@ -734,15 +784,15 @@ def sweep_fusion_fission_time(base: PhysSimParams, fusion_values=None, fiss_valu
                 ax.text(jj, ii, f"{val:.0f}", ha="center", va="center",
                          fontsize=6.5, color="black" if norm(val) < 0.7 else "white")
     fig.tight_layout()
-    fig.savefig(out / "fusion_fission_time.pdf")
+    fig.savefig(fig_out / "fusion_fission_time.pdf")
     plt.close(fig)
 
-    print(f"\n[Sweep] → {out / 'fusion_fission_time.pdf'}")
+    print(f"\n[Sweep] → {fig_out / 'fusion_fission_time.pdf'}")
     return mat_time, mat_dec, mat_conv
 
 
 def sweep_t_max(base: PhysSimParams, values=None, trials_per_cell: int = 100, seed: int = 0,
-                 processes: int | None = None, chunk_size: int = 50):
+                 processes: int | None = None, chunk_size: int = 50, cutoff_s: float | None = 10000.0):
     """
     Sweep T_0 (STAY wait-time ceiling) at fixed alpha_ctrl/beta_ctrl —
     held at whatever `base` has (like every other sweep function, these
@@ -752,6 +802,15 @@ def sweep_t_max(base: PhysSimParams, values=None, trials_per_cell: int = 100, se
     sweep — which only shrinks the wait for
     groups far from n_star (T = T_0*(1-alpha*r) -> T_0 as
     r=(n*-n)/n* -> 0) — this directly tests the wait-time floor itself.
+
+    At low T_0 a trial almost always eventually converges (conv_rate stays
+    ~1.0), but the tail is heavy: a small fraction of trials take extremely
+    long, dragging mean_time way up (std_time ends up close to mean_time).
+    `cutoff_s` (default 10000.0s) treats any trial slower than that as not
+    converged for reporting purposes — see _run_chunk — so mean_time/conv_rate
+    describe "converges within cutoff_s" rather than "converges eventually,
+    however long that takes". Pass None to disable and reproduce the old,
+    untruncated statistics.
     """
     from copy import deepcopy
     if values is None:
@@ -774,8 +833,9 @@ def sweep_t_max(base: PhysSimParams, values=None, trials_per_cell: int = 100, se
 
     processes = processes or os.cpu_count() or 1
     print(f"Sweeping T_0  {n} values  "
-          f"(alpha={base.alpha_ctrl} beta={base.beta_ctrl} fixed, {trials_per_cell} trials/point, {processes} processes) …")
-    results = _run_sweep_chunked(cell_params, labels, trials_per_cell, seed, processes, chunk_size)
+          f"(alpha={base.alpha_ctrl} beta={base.beta_ctrl} fixed, {trials_per_cell} trials/point, {processes} processes, "
+          f"cutoff_s={cutoff_s}) …")
+    results = _run_sweep_chunked(cell_params, labels, trials_per_cell, seed, processes, chunk_size, cutoff_s=cutoff_s)
     for i, res in enumerate(results):
         mean_dec[i]  = res['mean_dec']
         std_dec[i]   = res['std_dec']
@@ -783,8 +843,7 @@ def sweep_t_max(base: PhysSimParams, values=None, trials_per_cell: int = 100, se
         std_time[i]  = res['std_time']
         conv_rate[i] = res['conv_rate']
 
-    out = Path(base.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out, fig_out = _result_figure_dirs(base.out_dir)
     with open(out / "sweep_tmax.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["T_0", "mean_dec", "std_dec", "mean_time", "std_time", "conv_rate"])
@@ -793,17 +852,18 @@ def sweep_t_max(base: PhysSimParams, values=None, trials_per_cell: int = 100, se
                         round(mean_time[i], 3), round(std_time[i], 3), round(conv_rate[i], 3)])
 
     # paper-ready vector PDF (no title), matching convergence_time.pdf
-    fig, ax = plt.subplots(figsize=(6.5, 5.0), dpi=150)
-    ax.plot(values, mean_time, marker='o', color='C1')
+    fig, ax = plt.subplots(figsize=(6.5, 5.0), dpi=300)
+    ax.errorbar(values, mean_time, yerr=std_time, marker='o', color='C1',
+                ecolor='C1', elinewidth=1.0, capsize=3)
     ax.set_xlabel("T_0  (s)", fontsize=13)
     ax.set_ylabel("Mean convergence time (s)", fontsize=13)
     ax.tick_params(labelsize=11)
-    ax.grid(linestyle='--', alpha=0.4)
+    ax.grid(axis='y', linestyle='--', alpha=0.4)
     fig.tight_layout()
-    fig.savefig(out / "tmax_time.pdf")
+    fig.savefig(fig_out / "tmax_time.pdf")
     plt.close(fig)
 
-    print(f"\n[Sweep] → {out / 'tmax_time.pdf'}")
+    print(f"\n[Sweep] → {fig_out / 'tmax_time.pdf'}")
     return mean_dec, mean_time, conv_rate
 
 
@@ -826,10 +886,9 @@ if __name__ == "__main__":
         num_trials=500,
         max_dec=10000,
         max_time=100000.0,
-        out_dir="../output",
     )
-    # save_and_plot(run_trials(p, seed=0), p)
-    # sweep_alpha_beta(p, trials_per_cell=100, seed=0)
+    save_and_plot(run_trials(p, seed=0), p)
+    sweep_alpha_beta(p, trials_per_cell=100, seed=0)
 
     # Combined t_fusion_max x t_fiss_mean sensitivity figure, swept around
     # the *original* t_fiss_mean=6.0 physical baseline — independent of the
@@ -844,7 +903,6 @@ if __name__ == "__main__":
         alpha_ctrl=0.5,
         beta_ctrl=0.5,
         max_time=100000.0,
-        out_dir="../output",
     )
     sweep_fusion_fission_time(p_ref, trials_per_cell=100, seed=0)
 
@@ -866,7 +924,6 @@ if __name__ == "__main__":
         num_trials=500,
         max_dec=10000,
         max_time=100000.0,
-        out_dir="../output",
     )
 
-    # sweep_t_max(p_t, trials_per_cell=10000, seed=0)
+    sweep_t_max(p_t, trials_per_cell=10000, seed=0)
