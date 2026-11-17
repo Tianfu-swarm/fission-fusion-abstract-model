@@ -48,10 +48,12 @@ def _latest_result_dir(parent: Path) -> Path:
     return run
 
 
-def discover_range_groups(data_root: Path) -> dict[float, Path]:
-    """{follow_range: run_dir} for the newest fusion_time_follow_range_* batch,
-    empty dict if no such batch exists under data_root."""
-    multi_dir = _latest(data_root.iterdir(), "fusion_time_follow_range_")
+def discover_range_groups(data_root: Path, multi_dir: Path | None = None) -> dict[float, Path]:
+    """{follow_range: run_dir} for one fusion_time_follow_range_* batch —
+    `multi_dir` if given, otherwise the newest one under data_root (empty
+    dict if none exists)."""
+    if multi_dir is None:
+        multi_dir = _latest(data_root.iterdir(), "fusion_time_follow_range_")
     if multi_dir is None:
         return {}
     groups = {}
@@ -67,11 +69,12 @@ def discover_range_groups(data_root: Path) -> dict[float, Path]:
 
 # ── duration extraction ──────────────────────────────────────────────────────
 
-def _fusion_to_stay_durations(csv_path: Path) -> list[float]:
-    """Read one bot's log and return durations of FUSION runs that are
-    immediately followed by STAY (FUSION -> RANDOM_WALK runs are dropped;
-    a FUSION run still open at end-of-file is dropped too, since its
-    outcome is unknown)."""
+def _fusion_to_stay_durations(csv_path: Path) -> tuple[list[float], float]:
+    """Read one bot's log and return (durations, run_length) — durations of
+    FUSION runs that are immediately followed by STAY (FUSION -> RANDOM_WALK
+    runs are dropped; a FUSION run still open at end-of-file is dropped too,
+    since its outcome is unknown), and run_length = the log's last timestamp
+    (how long this bot was recorded for)."""
     times, states = [], []
     with open(csv_path, newline="") as f:
         for row in csv.reader(f):
@@ -94,7 +97,8 @@ def _fusion_to_stay_durations(csv_path: Path) -> list[float]:
             i = j
         else:
             i += 1
-    return durations
+    run_length = times[-1] if times else 0.0
+    return durations, run_length
 
 
 def collect_durations(run_dir: Path) -> list[float]:
@@ -102,9 +106,19 @@ def collect_durations(run_dir: Path) -> list[float]:
     if not bot_files:
         raise FileNotFoundError(f"No bot*.csv files found under {run_dir}")
     all_durations = []
+    run_lengths = []
     for bot_csv in bot_files:
-        all_durations.extend(_fusion_to_stay_durations(bot_csv))
-    print(f"  {run_dir}: {len(bot_files)} bot files, {len(all_durations)} FUSION→STAY episodes kept")
+        d, run_length = _fusion_to_stay_durations(bot_csv)
+        all_durations.extend(d)
+        run_lengths.append(run_length)
+
+    run_lengths = np.asarray(run_lengths)
+    if run_lengths.max() - run_lengths.min() < 0.01:  # effectively all the same
+        length_str = f"{run_lengths.mean():.1f}s"
+    else:
+        length_str = f"{run_lengths.min():.1f}-{run_lengths.max():.1f}s (mean {run_lengths.mean():.1f}s)"
+    print(f"  {run_dir}: {len(bot_files)} agents, run length {length_str}, "
+          f"{len(all_durations)} FUSION→STAY episodes kept")
     return all_durations
 
 
@@ -120,8 +134,11 @@ def plot_distribution(durations: list[float], bins: int, out_dir: Path, suffix: 
     probs = counts / counts.sum()          # normalized probability (sums to 1)
     centers = (edges[:-1] + edges[1:]) / 2
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / f"fusion_duration_distribution{suffix}.csv", "w", newline="") as f:
+    result_dir = out_dir / "result"
+    figure_dir = out_dir / "figure"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    with open(result_dir / f"fusion_duration_distribution{suffix}.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["bin_center_s", "bin_left_s", "bin_right_s", "count", "probability"])
         for c, lo, hi, cnt, p in zip(centers, edges[:-1], edges[1:], counts, probs):
@@ -137,7 +154,7 @@ def plot_distribution(durations: list[float], bins: int, out_dir: Path, suffix: 
     xs = edges[bin_idx] + rng.uniform(0.08, 0.92, size=len(durations)) * bin_width
     ys = rng.uniform(0.04, 0.96, size=len(durations)) * probs[bin_idx]
 
-    fig, ax = plt.subplots(figsize=(6.5, 5.0), dpi=150)
+    fig, ax = plt.subplots(figsize=(6.5, 5.0), dpi=300)
     ax.bar(centers, probs, width=bin_width * 0.95, color="#cde2fb",
            edgecolor="#2a78d6", linewidth=1.0, zorder=1)
     ax.scatter(xs, ys, s=14, color="#184f95", alpha=0.75,
@@ -149,13 +166,13 @@ def plot_distribution(durations: list[float], bins: int, out_dir: Path, suffix: 
     ax.grid(linestyle="--", alpha=0.4)
     ax.tick_params(labelsize=11)
     fig.tight_layout()
-    fig.savefig(out_dir / f"fusion_duration_distribution{suffix}.pdf")
+    fig.savefig(figure_dir / f"fusion_duration_distribution{suffix}.pdf")
     plt.close(fig)
 
     print(f"  n={len(durations)}  mean={durations.mean():.3f}s  median={np.median(durations):.3f}s  "
           f"max={durations.max():.3f}s")
-    print(f"  [Plot] -> {out_dir / f'fusion_duration_distribution{suffix}.pdf'}")
-    print(f"  [Data] -> {out_dir / f'fusion_duration_distribution{suffix}.csv'}")
+    print(f"  [Plot] -> {figure_dir / f'fusion_duration_distribution{suffix}.pdf'}")
+    print(f"  [Data] -> {result_dir / f'fusion_duration_distribution{suffix}.csv'}")
 
 
 def plot_range_comparison(durations_by_range: dict[float, list[float]], bins: int, out_dir: Path):
@@ -165,11 +182,14 @@ def plot_range_comparison(durations_by_range: dict[float, list[float]], bins: in
     edges = np.linspace(0.0, global_max, bins + 1)
     centers = (edges[:-1] + edges[1:]) / 2
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "fusion_duration_by_range.csv", "w", newline="") as f:
+    result_dir = out_dir / "result"
+    figure_dir = out_dir / "figure"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    with open(result_dir / "fusion_duration_by_range.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["follow_range", "bin_center_s", "count", "probability"])
-        fig, ax = plt.subplots(figsize=(7.0, 5.0), dpi=150)
+        fig, ax = plt.subplots(figsize=(7.0, 5.0), dpi=300)
         for i, r in enumerate(sorted(durations_by_range)):
             d = np.asarray(durations_by_range[r])
             counts, _ = np.histogram(d, bins=edges)
@@ -187,11 +207,11 @@ def plot_range_comparison(durations_by_range: dict[float, list[float]], bins: in
     ax.tick_params(labelsize=11)
     ax.legend(fontsize=10)
     fig.tight_layout()
-    fig.savefig(out_dir / "fusion_duration_by_range.pdf")
+    fig.savefig(figure_dir / "fusion_duration_by_range.pdf")
     plt.close(fig)
 
-    print(f"\n[Plot] -> {out_dir / 'fusion_duration_by_range.pdf'}")
-    print(f"[Data] -> {out_dir / 'fusion_duration_by_range.csv'}")
+    print(f"\n[Plot] -> {figure_dir / 'fusion_duration_by_range.pdf'}")
+    print(f"[Data] -> {result_dir / 'fusion_duration_by_range.csv'}")
 
 
 def plot_distribution_grouped(durations_by_range: dict[float, list[float]], bins: int, out_dir: Path):
@@ -209,12 +229,15 @@ def plot_distribution_grouped(durations_by_range: dict[float, list[float]], bins
     sub_width = group_width / n
     rng = np.random.default_rng(0)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(7.5, 5.0), dpi=150)
+    result_dir = out_dir / "result"
+    figure_dir = out_dir / "figure"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.5, 5.0), dpi=300)
 
     x_smooth = np.linspace(1e-6, global_max, 300)
     fit_rows = []
-    with open(out_dir / "fusion_duration_distribution.csv", "w", newline="") as f:
+    with open(result_dir / "fusion_duration_distribution.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["follow_range", "bin_center_s", "bin_left_s", "bin_right_s", "count", "probability"])
         for i, r in enumerate(ranges):
@@ -255,11 +278,106 @@ def plot_distribution_grouped(durations_by_range: dict[float, list[float]], bins
     ax.tick_params(labelsize=11)
     ax.legend(fontsize=10)
     fig.tight_layout()
-    fig.savefig(out_dir / "fusion_duration_distribution.pdf")
+    fig.savefig(figure_dir / "fusion_duration_distribution.pdf")
     plt.close(fig)
 
-    print(f"\n[Plot] -> {out_dir / 'fusion_duration_distribution.pdf'}")
-    print(f"[Data] -> {out_dir / 'fusion_duration_distribution.csv'}")
+    print(f"\n[Plot] -> {figure_dir / 'fusion_duration_distribution.pdf'}")
+    print(f"[Data] -> {result_dir / 'fusion_duration_distribution.csv'}")
+
+
+# ── goodness of fit: is Gamma actually a reasonable choice? ─────────────────
+
+_GOF_CANDIDATES = {
+    # name -> (scipy dist, fit kwargs). All three are non-negative-support
+    # families, so loc is pinned to 0 for all of them (duration can't start
+    # before zero).
+    "exponential": (stats.expon,   {"floc": 0}),
+    "gamma":       (stats.gamma,   {"floc": 0}),
+    "lognorm":     (stats.lognorm, {"floc": 0}),
+}
+
+
+def goodness_of_fit(durations_by_range: dict[float, list[float]], out_dir: Path) -> dict:
+    """Fit Exponential / Gamma / Log-normal (loc pinned to 0) to
+    each follow range's positive durations, score by AIC (lower better) and
+    a KS test (p > 0.05 -> not rejected), and save a CSV. Answers "is Gamma
+    a reasonable choice" quantitatively rather than by eye. Returns
+    {range: gamma_params} for reuse by the CDF plot."""
+    result_dir = out_dir / "result"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    gamma_params = {}
+    print("\nGoodness of fit (lower AIC = better; KS p > 0.05 = not rejected):")
+    for r in sorted(durations_by_range):
+        d = np.asarray(durations_by_range[r])
+        d = d[d > 0]
+        fits = []
+        for name, (dist, fit_kwargs) in _GOF_CANDIDATES.items():
+            params = dist.fit(d, **fit_kwargs)
+            ll = np.sum(dist.logpdf(d, *params))
+            k_free = len(params) - len(fit_kwargs)
+            aic = 2 * k_free - 2 * ll
+            ks_stat, ks_p = stats.kstest(d, dist.cdf, args=params)
+            fits.append((name, aic, ks_stat, ks_p, params))
+            if name == "gamma":
+                gamma_params[r] = params
+        fits.sort(key=lambda t: t[1])
+        print(f"  follow range={r:g}  (n={len(d)}):")
+        for name, aic, ks_stat, ks_p, params in fits:
+            print(f"    {name:12s} AIC={aic:9.2f}  KS_stat={ks_stat:.4f}  KS_p={ks_p:.4f}")
+            rows.append([r, name, round(aic, 3), round(ks_stat, 4), round(ks_p, 4)]
+                        + [round(v, 4) for v in params])
+
+    with open(result_dir / "fusion_duration_goodness_of_fit.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["follow_range", "distribution", "AIC", "KS_stat", "KS_p",
+                     "param1_shape_or_s", "param2_loc", "param3_scale"])
+        w.writerows(rows)
+    print(f"\n[Data] -> {result_dir / 'fusion_duration_goodness_of_fit.csv'}")
+    return gamma_params
+
+
+def plot_goodness_of_fit(durations_by_range: dict[float, list[float]], gamma_params: dict, out_dir: Path):
+    """All follow ranges on one set of axes: empirical CDF (solid step) vs
+    the fitted Gamma CDF (dashed curve), same color per range — if a step
+    function hugs its matching dashed curve, the Gamma fit is a good
+    description of that range's data, which is the direct visual evidence
+    the AIC/KS numbers only summarize."""
+    from matplotlib.lines import Line2D
+
+    figure_dir = out_dir / "figure"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    ranges = sorted(durations_by_range)
+    fig, ax = plt.subplots(figsize=(7.0, 5.5), dpi=300)
+    global_max = 0.0
+    for r, color in zip(ranges, [f"C{i}" for i in range(len(ranges))]):
+        d = np.sort(np.asarray(durations_by_range[r]))
+        d = d[d > 0]
+        global_max = max(global_max, d[-1])
+        ecdf = np.arange(1, len(d) + 1) / len(d)
+        ax.step(d, ecdf, where="post", color=color, linewidth=1.8,
+                 label=f"follow range = {r:g}")
+        shape, loc, scale = gamma_params[r]
+        x = np.linspace(0, d[-1], 300)
+        ax.plot(x, stats.gamma.cdf(x, shape, loc, scale), color=color,
+                 linewidth=1.8, linestyle="--")
+
+    style_handles = [Line2D([0], [0], color="#333333", linewidth=1.8, label="Empirical"),
+                      Line2D([0], [0], color="#333333", linewidth=1.8, linestyle="--", label="Gamma fit")]
+    range_legend = ax.legend(loc="lower right", fontsize=10)
+    ax.add_artist(range_legend)
+    ax.legend(handles=style_handles, loc="center right", fontsize=10)
+
+    ax.set_xlabel("Fusion duration (s)", fontsize=13)
+    ax.set_ylabel("Cumulative probability", fontsize=13)
+    ax.set_xlim(0, global_max)
+    ax.set_ylim(0, 1)
+    ax.grid(linestyle="--", alpha=0.4)
+    ax.tick_params(labelsize=11)
+    fig.tight_layout()
+    fig.savefig(figure_dir / "fusion_duration_gof.pdf")
+    plt.close(fig)
+    print(f"[Plot] -> {figure_dir / 'fusion_duration_gof.pdf'}")
 
 
 def main():
@@ -269,8 +387,13 @@ def main():
     ap.add_argument("--data-dir", type=Path, default=None,
                      help="A single result_* run directory (containing bot*.csv). "
                           "Overrides auto-detection; disables the range comparison plot.")
-    ap.add_argument("--bins", type=int, default=12)
-    ap.add_argument("--out-dir", type=Path, default=here / ".." / "output")
+    ap.add_argument("--batch-dir", type=Path, default=None,
+                     help="A specific data/fusion_time_follow_range_* directory to use "
+                          "(containing fr<range>/result_*/bot*.csv). Defaults to the "
+                          "newest such directory under ../data.")
+    ap.add_argument("--bins", type=int, default=30)
+    ap.add_argument("--out-dir", type=Path,
+                     default=here / ".." / "output" / "fusion_duration_distribution")
     args = ap.parse_args()
 
     if args.data_dir is not None:
@@ -279,7 +402,7 @@ def main():
         plot_distribution(durations, args.bins, args.out_dir)
         return
 
-    groups = discover_range_groups(data_root)
+    groups = discover_range_groups(data_root, args.batch_dir)
     if not groups:
         run_dir = _latest_result_dir(data_root)
         print(f"Reading {run_dir}")
@@ -297,6 +420,9 @@ def main():
     plot_distribution_grouped(durations_by_range, args.bins, args.out_dir)
     if len(durations_by_range) > 1:
         plot_range_comparison(durations_by_range, args.bins, args.out_dir)
+
+    gamma_params = goodness_of_fit(durations_by_range, args.out_dir)
+    plot_goodness_of_fit(durations_by_range, gamma_params, args.out_dir)
 
 
 if __name__ == "__main__":
